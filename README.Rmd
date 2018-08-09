@@ -1,0 +1,113 @@
+---
+output: github_document
+---
+
+<!-- README.md is generated from README.Rmd. Please edit that file -->
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  dpi = 320,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+#  The causal effect of RHC on death using inverse probability weighting
+
+```{r}
+library(tidyverse)
+library(broom)
+library(geepack)
+
+rhc <- read_csv("rhc.csv") %>% 
+  rename(id = X1) %>% 
+  mutate(swang1 = factor(swang1, levels = c("No RHC", "RHC")),
+         death = factor(death, levels = c("No", "Yes")))
+
+ps_variables <- rhc %>% 
+  select(-id, -sadmdte:-death, -cat1:-cat2, -t3d30, -dth30, -swang1, -ortho, -adld3p, -ptid) %>% 
+  names()
+
+fmla <- paste("swang1 ~", paste(ps_variables, collapse = "+")) %>% 
+  as.formula()
+
+propensity <- rhc %>% 
+  mutate_if(is.character, factor) %>% 
+  glm(fmla, family = binomial(), data = .)
+
+propensity %>% 
+  tidy(conf.int = TRUE) %>% 
+  select(-statistic, -p.value) %>% 
+  mutate_at(vars(-term, -std.error), exp) %>% 
+  knitr::kable(digits = 2)
+
+rhc <- propensity %>% 
+  augment(type.predict = "response", data = rhc) %>% 
+  # propensity for treatment in exposed, 
+  # propensity of non-treatment in unexposed
+  mutate(wts = 1 / ifelse(swang1 == "No RHC", 1 - .fitted, .fitted)) 
+    
+rhc %>% 
+  summarize(mean_wt = mean(wts), sd_wts = sd(wts), min_wts = min(wts), max_wts = max(wts)) %>% 
+  knitr::kable(digits = 2)
+
+rhc %>% 
+  group_by(swang1) %>% 
+  summarize(mean_wt = mean(wts), sd_wts = sd(wts), min_wts = min(wts), max_wts = max(wts)) %>% 
+  knitr::kable(digits = 2)
+
+#  marginal probability of RHC
+sw_model <- glm(swang1 ~ 1, data = rhc, family = binomial())
+
+numerator <- predict(sw_model, type = "response")
+
+percentiles <- quantile(rhc$wts, probs = c(.01, .99))
+
+rhc <- rhc %>% 
+  mutate(
+    # truncate weights (less extreme weights)
+    twts = case_when(
+      wts < percentiles[1] ~ percentiles[1],
+      wts > percentiles[2] ~ percentiles[2],
+      TRUE ~ wts
+    ),
+    # stabilize weights (better efficiency and coverage)
+    swts = numerator / (1 / twts), 
+)
+
+rhc %>% 
+  summarize(mean_wt = mean(swts), sd_wts = sd(swts), min_wts = min(swts), max_wts = max(swts)) %>% 
+  knitr::kable(digits = 2)
+
+rhc %>% 
+  gather("wt_type", "value", wts, twts, swts) %>% 
+  ggplot(aes(value)) +
+    geom_density(col = "#E69F00", fill = "#E69F0099") + 
+    facet_wrap(~ wt_type, scales = "free_x") +
+    scale_x_log10() + 
+    theme_minimal(base_size = 14) + 
+    xlab("log10(Weights)") 
+
+# fit a marginal structural model
+# a little trouble with factors with these. 
+rhc <- rhc %>% 
+  mutate(y = ifelse(death == "Yes", 1, 0))
+
+msm <- geeglm(y ~ swang1, 
+                  data = rhc, 
+                  family = binomial(),
+                  std.err = "san.se", # default robust SE 
+                  weights = swts, # inverse probability weights
+                  id = id, # pt ide
+                  corstr = "independence") # independent correlation structure
+tidy(msm)
+
+#  standard error a little too small
+glm(death ~ swang1, data = rhc, weights = swts, family = binomial()) %>% 
+  tidy()
+
+# can also bootstrap SE/CIs
+```
+
